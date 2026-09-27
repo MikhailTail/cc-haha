@@ -1,3 +1,4 @@
+import { getSideChat, isSideChatId } from '../services/sideChatRegistry.js'
 /**
  * WebSocket connection handler
  *
@@ -9,6 +10,7 @@
 import type { ServerWebSocket } from 'bun'
 import { sessionMessageUuid } from '../../utils/sessionMessageInbox.js'
 import { parseSessionCollaborationEnvelope } from '../../utils/sessionCollaborationEnvelope.js'
+import { isShutdownTeamPrompt } from '../../utils/swarm/teamShutdownPrompt.js'
 import { admitSessionUserTurn, emitSessionTurnEvent } from '../services/sessionTurnEvents.js'
 import { ApiError } from '../middleware/errorHandler.js'
 import { resolveSessionReferenceContext, splitSessionReferenceContext } from '../services/sessionReferenceContext.js'
@@ -1120,11 +1122,7 @@ function sessionTurnConnection(
 }
 
 export function stopSessionTurn(sessionId: string): void {
-  const hadActiveTurn = activeUserTurns.has(sessionId)
   handleStopGeneration(sessionTurnConnection(sessionId, { serverHost: '127.0.0.1', serverPort: 0 }))
-  // A result can clear the host turn while peer work still waits in the CLI
-  // inbox. Group Stop must revoke that queue even at the idle boundary.
-  if (!hadActiveTurn && conversationService.hasSession(sessionId)) conversationService.sendInterrupt(sessionId)
 }
 
 export function isSessionTurnStopped(sessionId: string): boolean {
@@ -1643,6 +1641,11 @@ async function handlePlanApprovalWithRuntimeOverride(
     return
   }
 
+  if (isSideChatId(sessionId) && (currentProviderId !== nextOverride.providerId || (nextOverride.effort !== undefined && nextOverride.effort !== currentEffort))) {
+    sendMessage(ws, { type: 'error', code: 'SIDE_CHAT_RUNTIME_RESTART_UNAVAILABLE', message: 'Open a new side chat to change provider or reasoning effort.' })
+    return
+  }
+
   const canSwitchInProcess =
     conversationService.hasSession(sessionId) &&
     currentProviderId === nextOverride.providerId &&
@@ -1811,7 +1814,7 @@ async function applyPermissionModeToActiveSession(
     }
     await commitConfirmedPermissionMode(sessionId, mode)
   } catch (err) {
-    if (shouldFallbackToPermissionRestart(mode, err)) {
+    if (!isSideChatId(sessionId) && shouldFallbackToPermissionRestart(mode, err)) {
       await restartSessionWithPermissionMode(ws, sessionId, mode)
       return
     }
@@ -1891,6 +1894,21 @@ async function handleSetRuntimeConfig(
     }
 
     const nextOverride = normalized.override
+    const side = getSideChat(sessionId)
+    if (side?.started) {
+      const current = runtimeOverrides.get(sessionId)
+      const provider = current?.providerId ?? side.launchInfo.runtimeProviderId ?? null
+      const effort = current?.effort ?? side.launchInfo.effortLevel
+      if (!conversationService.hasSession(sessionId) || provider !== nextOverride.providerId || (nextOverride.effort !== undefined && nextOverride.effort !== effort)) {
+        sendMessage(ws, { type: 'error', code: 'SIDE_CHAT_RUNTIME_RESTART_UNAVAILABLE', message: 'A temporary side chat cannot restart without losing its history. Open a new side chat to change provider or reasoning effort.' })
+        return
+      }
+      await conversationService.setModel(sessionId, nextOverride.modelId)
+      runtimeOverrides.set(sessionId, { ...nextOverride, ...(effort ? { effort } : {}) })
+      await persistSessionRuntimeConfig(sessionId, runtimeOverrides.get(sessionId)!)
+      broadcastAppliedRuntimeConfig(sessionId)
+      return
+    }
     const prevOverride = runtimeOverrides.get(sessionId)
     if (
       prevOverride &&
@@ -2179,6 +2197,10 @@ function handleStopGeneration(ws: SessionConnection) {
         removePendingInterruptedTurnResult(sessionId)
       }
     }
+  } else if (!stoppedTurn && conversationService.hasSession(sessionId)) {
+    // The leader can already be idle while approved process teammates still
+    // run or await readiness. Both UI and programmatic Stop revoke those workers.
+    conversationService.sendInterrupt(sessionId)
   }
 
   if ((stoppedTurn || agentTasks.length > 0) && conversationService.hasSession(sessionId)) {
@@ -3467,7 +3489,7 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
       }
 
       const replayText = extractReplayUserText(cliMsg)
-      if (replayText) {
+      if (replayText && !isShutdownTeamPrompt(cliMsg.message?.content) && (!cliMsg.isMeta || parseSessionCollaborationEnvelope(replayText))) {
         const collaborationEnvelope = parseSessionCollaborationEnvelope(replayText)
         messages.push(collaborationEnvelope
           ? {
@@ -4394,6 +4416,9 @@ function forwardCliMessageToClient(
   handleCliPermissionModeBroadcast(sessionId, cliMsg)
   const serverMsgs = translateCliMessage(cliMsg, sessionId)
   for (const msg of serverMsgs) sendMessage(ws, msg)
+  // Completing the leader turn clears renderer prompts; independent workers
+  // may still be awaiting an answer, so restore them after that boundary.
+  if (serverMsgs.some(msg => msg.type === 'message_complete')) replayPendingPermissionRequests(ws, sessionId)
 }
 
 function forwardCliMessageToSessionClients(sessionId: string, cliMsg: any): void {
@@ -4403,6 +4428,7 @@ function forwardCliMessageToSessionClients(sessionId: string, cliMsg: any): void
   const serverMsgs = translateCliMessage(cliMsg, sessionId)
   for (const ws of clients) {
     for (const msg of serverMsgs) sendMessage(ws, msg)
+    if (serverMsgs.some(msg => msg.type === 'message_complete')) replayPendingPermissionRequests(ws, sessionId)
   }
 }
 

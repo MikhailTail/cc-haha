@@ -44,6 +44,7 @@ export type AttachmentRef = {
   diffSide?: 'old' | 'new'
   hunkId?: string
   note?: string
+  referenceKind?: 'chat-selection'
   quote?: string
   selectionNumber?: number
 }
@@ -78,6 +79,7 @@ export type UIAttachment = {
   diffSide?: 'old' | 'new'
   hunkId?: string
   note?: string
+  referenceKind?: 'chat-selection'
   quote?: string
   selectionNumber?: number
 }
@@ -159,6 +161,7 @@ export type ServerMessage =
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
   | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_plan_updated'; teamName: string; sessionId: string; planId: string; revision: number; state: string; incarnationId: string }
   | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
@@ -346,7 +349,7 @@ export type UIMessage =
    * the user's own prompt render identically, which is what flattened the
    * member transcript.
    */
-  | { id: string; type: 'user_text'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string }; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; teammateFrom?: string }
+  | { id: string; type: 'user_text'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string }; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; awaitingReplay?: boolean; teammateFrom?: string }
   | { id: string; type: 'assistant_text'; content: string; transcriptMessageId?: string; timestamp: number; model?: string }
   | { id: string; type: 'thinking'; content: string; timestamp: number }
   | {
@@ -364,7 +367,7 @@ export type UIMessage =
     }
   | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
   | { id: string; type: 'background_task'; task: BackgroundAgentTask; timestamp: number }
-  | { id: string; type: 'system'; content: string; timestamp: number }
+  | { id: string; type: 'system'; content: string; generationStopped?: boolean; transcriptMessageId?: string; timestamp: number }
   | {
       id: string
       type: 'compact_summary'

@@ -1,4 +1,5 @@
 import { isInlineImagePath } from '@/lib/attachmentImages'
+import { isSideChatSession } from '@/lib/sideChatSessions'
 import { CHAT_HISTORY_CACHE_BYTES, historyCacheBytes } from '../lib/chatHistoryCache'
 import { normalizeSessionReferences, splitSessionReferenceContext } from '@/lib/sessionReferences'
 import { create } from 'zustand'
@@ -7,6 +8,7 @@ import { wsManager } from '../api/websocket'
 import { sessionsApi, type SessionHistoryPage } from '../api/sessions'
 import { ApiResponseParseError } from '../api/client'
 import { subagentsApi } from '../api/subagents'
+import { useTeamPlanStore } from './teamPlanStore'
 import { useTeamStore } from './teamStore'
 import { useSessionStore } from './sessionStore'
 import { useCLITaskStore } from './cliTaskStore'
@@ -125,6 +127,7 @@ type PendingComputerUsePermissions = Record<string, PendingComputerUsePermission
 export type PerSessionState = {
   messages: UIMessage[]
   chatState: ChatState
+  permissionMode?: PermissionMode
   /**
    * The first prompt is waiting for an empty placeholder session to be
    * replaced with its selected branch/worktree session. This is UI-only turn
@@ -1455,6 +1458,24 @@ function dropDuplicateTranscriptTextMessages(messages: UIMessage[]): UIMessage[]
   return changed ? deduped : messages
 }
 
+function collapseDuplicateStoppedStatuses(messages: UIMessage[]): UIMessage[] {
+  let changed = false
+  const collapsed: UIMessage[] = []
+  for (const message of messages) {
+    const previous = collapsed.at(-1)
+    if (message.type === 'system' && message.generationStopped &&
+      previous?.type === 'system' && previous.generationStopped) {
+      changed = true
+      if (message.transcriptMessageId && !previous.transcriptMessageId) {
+        collapsed[collapsed.length - 1] = message
+      }
+      continue
+    }
+    collapsed.push(message)
+  }
+  return changed ? collapsed : messages
+}
+
 type ParentLinkedToolMessage = Extract<
   UIMessage,
   { type: 'tool_use' | 'tool_result' }
@@ -1585,7 +1606,7 @@ function mergeRestoredHistoryIntoLiveMessages(
   messages: UIMessage[],
   restoredMessages: UIMessage[],
 ): UIMessage[] {
-  return mergeRestoredTerminalGoalEvents(
+  return collapseDuplicateStoppedStatuses(mergeRestoredTerminalGoalEvents(
     mergeRestoredParentToolMessages(
       dropDuplicateTranscriptTextMessages(
         mergeRestoredTranscriptMessageIds(messages, restoredMessages),
@@ -1593,7 +1614,7 @@ function mergeRestoredHistoryIntoLiveMessages(
       restoredMessages,
     ),
     restoredMessages,
-  )
+  ))
 }
 
 function nonEmptyHistoryIdentityPart(value: string | undefined): string | undefined {
@@ -1978,7 +1999,7 @@ function mergeColdRestoredHistoryIntoLiveMessages(
     ordered.push(...(beforeRows.get(index)?.reverse() ?? []))
     if (index < restoredCount) ordered.push(merged[index]!)
   }
-  return ordered
+  return collapseDuplicateStoppedStatuses(ordered)
 }
 
 function needsTranscriptIdHydrationRetry(session: PerSessionState | undefined): boolean {
@@ -2951,6 +2972,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   getSession: (sessionId) => get().sessions[sessionId] ?? createDefaultSessionState(),
 
   connectToSession: (sessionId, options) => {
+    if (isSideChatSession(sessionId)) options = { ...options, minimalBootstrap: true }
     if (!options?.minimalBootstrap) {
       void useCLITaskStore.getState().fetchSessionTasks(sessionId)
     }
@@ -2998,7 +3020,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           // A new connection lifecycle may have durable transcript rows that
           // were persisted while this renderer was offline. Keep the visible
           // cache, but require one lossless durable backfill for this lifecycle.
-          historyHydrated: false,
+          historyHydrated: isSideChatSession(sessionId),
+          ...(isSideChatSession(sessionId) ? { historyStatus: 'ready' as const } : {}),
           awaitingReconnectSync: false,
           preHydrationSocketGapPending: false,
           historyBootstrapDisabled: options?.minimalBootstrap === true,
@@ -3173,8 +3196,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       wsManager.send(sessionId, { type: 'prewarm_session' })
     }
 
-    if (!options?.minimalBootstrap) {
-      get().loadHistory(sessionId)
+    if (!options?.minimalBootstrap || isSideChatSession(sessionId)) {
+      if (!options?.minimalBootstrap) get().loadHistory(sessionId)
       sessionsApi.getSlashCommands(sessionId)
         .then(({ commands }) => {
           if (get().sessions[sessionId]) {
@@ -3238,6 +3261,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             hunkId: a.hunkId,
             note: a.note,
             quote: a.quote,
+            referenceKind: a.referenceKind,
             selectionNumber: a.selectionNumber,
           }))
         : undefined
@@ -3285,7 +3309,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         ...(userFacingContent !== modelFacingContent ? { modelContent: modelFacingContent } : {}),
         attachments: isDirectAgentSession ? undefined : uiAttachments,
         timestamp: now,
-        ...(isDirectAgentSession ? { pending: true } : {}),
+        ...(isDirectAgentSession ? { pending: true } : { awaitingReplay: true }),
       })
 
       if (!isDirectAgentSession && session.elapsedTimer) clearInterval(session.elapsedTimer)
@@ -3498,12 +3522,21 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       const messagesWithFlushedText = pendingAssistantText.trim()
         ? appendAssistantTextMessage(session.messages, pendingAssistantText, Date.now())
         : session.messages
+      const stoppedMessages = pendingAssistantText.trim()
+        ? [...messagesWithFlushedText, {
+            id: nextId(),
+            type: 'system' as const,
+            content: t('chat.generationStopped'),
+            generationStopped: true,
+            timestamp: Date.now(),
+          }]
+        : messagesWithFlushedText
       return {
         sessions: {
           ...s.sessions,
           [sessionId]: {
             ...session,
-            messages: markPendingToolUseMessagesStopped(messagesWithFlushedText),
+            messages: markPendingToolUseMessagesStopped(stoppedMessages),
             chatState: 'idle',
             activeToolUseId: null,
             activeToolName: null,
@@ -3545,6 +3578,10 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   loadHistory: async (sessionId, options) => {
+    if (isSideChatSession(sessionId)) {
+      set((state) => ({ sessions: updateSessionIn(state.sessions, sessionId, () => ({ historyStatus: 'ready', historyHydrated: true })) }))
+      return
+    }
     if (historyPageControllers.has(sessionId)) {
       historyPageControllers.get(sessionId)?.abort()
       historyPageControllers.delete(sessionId)
@@ -4013,10 +4050,12 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   loadOlderHistory: async (sessionId) => {
+    if (isSideChatSession(sessionId)) return
     await loadOlderHistoryPage(sessionId, get, set)
   },
 
   reloadHistory: async (sessionId, guard) => {
+    if (isSideChatSession(sessionId)) return
     if (historyPageControllers.has(sessionId)) {
       historyPageControllers.get(sessionId)?.abort()
       historyPageControllers.delete(sessionId)
@@ -4525,6 +4564,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
 
     switch (msg.type) {
       case 'connected':
+        void useTeamPlanStore.getState().refresh(sessionId)
         // Team lifecycle broadcasts are transition-only. A reconnect must
         // reconcile against the durable workbench so missed update/delete or
         // same-name recreate events cannot leave a live cache authoritative.
@@ -4845,6 +4885,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         // 选择器拿到无法渲染的值。
         const KNOWN_MODES: PermissionMode[] = ['default', 'acceptEdits', 'auto', 'plan', 'bypassPermissions', 'dontAsk']
         if (KNOWN_MODES.includes(msg.mode)) {
+          update(() => ({ permissionMode: msg.mode }))
           useSessionStore.getState().updateSessionPermissionMode(sessionId, msg.mode)
         }
         break
@@ -5601,6 +5642,10 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             }),
           }
         })
+        break
+
+      case 'team_plan_updated':
+        if (msg.sessionId === sessionId) void useTeamPlanStore.getState().refresh(sessionId)
         break
 
       case 'team_created':
@@ -7497,8 +7542,8 @@ export function appendReplayedUserMessage(
   const currentTurnUserIndex = findCurrentTurnUserMessageIndex(messages, modelContent, parsed)
   if (currentTurnUserIndex >= 0) {
     const optimisticMessage = messages[currentTurnUserIndex]
-    if (optimisticMessage?.type === 'user_text' && optimisticMessage.optimisticQueued) {
-      const { optimisticQueued: _optimisticQueued, ...confirmedMessage } = optimisticMessage
+    if (optimisticMessage?.type === 'user_text' && (optimisticMessage.optimisticQueued || optimisticMessage.awaitingReplay)) {
+      const { optimisticQueued: _optimisticQueued, awaitingReplay: _awaitingReplay, ...confirmedMessage } = optimisticMessage
       return [
         ...messages.slice(0, currentTurnUserIndex),
         confirmedMessage,
@@ -7563,6 +7608,7 @@ function mapQueuedDisplayAttachments(attachments?: AttachmentRef[]): UIAttachmen
     hunkId: attachment.hunkId,
     note: attachment.note,
     quote: attachment.quote,
+    referenceKind: attachment.referenceKind,
     selectionNumber: attachment.selectionNumber,
   }))
 }
@@ -7572,13 +7618,30 @@ function findCurrentTurnUserMessageIndex(
   modelContent: string,
   replayDisplay: RestoredUserDisplay,
 ): number {
+  // Guides are rendered before the CLI consumes them. The initial prompt's
+  // ACK can arrive after several guides, so match outstanding input in send
+  // order (including identical prompts), bounded by the current user turn.
+  let turnStart = 0
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
-    if (message?.type !== 'user_text') {
-      continue
+    if (message?.type === 'user_text' && !message.optimisticQueued) {
+      turnStart = index
+      break
     }
-    return replayMatchesCurrentUserMessage(message, replayDisplay, modelContent) ? index : -1
   }
+  for (let index = turnStart; index < messages.length; index += 1) {
+    const message = messages[index]
+    if (
+      message?.type === 'user_text' &&
+      (message.awaitingReplay || message.optimisticQueued) &&
+      replayMatchesCurrentUserMessage(message, replayDisplay, modelContent)
+    ) return index
+  }
+  const current = messages[turnStart]
+  if (
+    current?.type === 'user_text' &&
+    replayMatchesCurrentUserMessage(current, replayDisplay, modelContent)
+  ) return turnStart
   return -1
 }
 
@@ -7725,6 +7788,21 @@ export function mapHistoryMessagesToUiMessages(
     }
 
     const timestamp = new Date(msg.timestamp).getTime()
+    if (
+      msg.type === 'system' &&
+      msg.content && typeof msg.content === 'object' &&
+      (msg.content as { subtype?: unknown }).subtype === 'generation_stopped'
+    ) {
+      uiMessages.push({
+        id: msg.id || nextId(),
+        type: 'system',
+        content: t('chat.generationStopped'),
+        generationStopped: true,
+        ...(msg.id ? { transcriptMessageId: msg.id } : {}),
+        timestamp,
+      })
+      continue
+    }
     if (msg.type === 'system' && typeof msg.content === 'string') {
       if (msg.content.trim() === 'Conversation compacted' || msg.content.trim() === 'Context compacted') {
         const compactMessages = appendOrUpdateTailCompactSummary(

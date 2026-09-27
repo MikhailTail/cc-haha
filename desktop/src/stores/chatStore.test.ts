@@ -10,8 +10,10 @@ import {
   hasVisibleSessionActivity,
 } from '../components/activity/sessionActivityModel'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
+import { registerSideChatSession, unregisterSideChatSession } from '../lib/sideChatSessions'
 
 const {
+  refreshTeamPlanMock,
   sendMock,
   getMemberBySessionIdMock,
   sendMessageToMemberMock,
@@ -40,6 +42,7 @@ const {
   tabStoreListeners,
   providerStoreSnapshot,
 } = vi.hoisted(() => ({
+  refreshTeamPlanMock: vi.fn(async () => {}),
   sendMock: vi.fn(),
   getMemberBySessionIdMock: vi.fn<(sessionId: string) => any>(() => null),
   sendMessageToMemberMock: vi.fn(async () => {}),
@@ -82,6 +85,8 @@ const {
   tabStoreListeners: new Set<(state: any, previous: any) => void>(),
   providerStoreSnapshot: { providers: [] as SavedProvider[], activeId: null as string | null },
 }))
+
+vi.mock('./teamPlanStore', () => ({ useTeamPlanStore: { getState: () => ({ refresh: refreshTeamPlanMock }) } }))
 
 vi.mock('./providerStore', () => ({
   useProviderStore: { getState: () => providerStoreSnapshot },
@@ -247,6 +252,20 @@ describe('stripGeneratedImageMetadataLines', () => {
 })
 
 describe('Agent Teams workbench invalidation', () => {
+  it('refreshes durable plans on reconnect and only accepts matching-session invalidation', () => {
+    refreshTeamPlanMock.mockClear()
+    useChatStore.getState().handleServerMessage('lead', { type: 'connected', sessionId: 'lead' })
+    useChatStore.getState().handleServerMessage('lead', {
+      type: 'team_plan_updated', sessionId: 'other', teamName: 'team', planId: 'plan', incarnationId: 'incarnation', revision: 2, state: 'review_pending',
+    })
+    expect(refreshTeamPlanMock).toHaveBeenCalledTimes(1)
+    useChatStore.getState().handleServerMessage('lead', {
+      type: 'team_plan_updated', sessionId: 'lead', teamName: 'team', planId: 'plan', incarnationId: 'incarnation', revision: 3, state: 'review_pending',
+    })
+    expect(refreshTeamPlanMock).toHaveBeenCalledTimes(2)
+    expect(refreshTeamPlanMock).toHaveBeenLastCalledWith('lead')
+  })
+
   it('binds team creation to the lead session before workbench hydration', () => {
     handleTeamCreatedMock.mockReset()
 
@@ -482,6 +501,34 @@ describe('chatStore background agent activity interleaving', () => {
 })
 
 describe('chatStore history mapping', () => {
+  it('never replaces temporary side-chat messages with empty durable history', async () => {
+    const id = 'side-history-test'
+    registerSideChatSession(id, 'parent-history-test')
+    const messages: UIMessage[] = [{ id: 'side-answer', type: 'assistant_text', content: 'Retain this answer', timestamp: 1 }]
+    useChatStore.setState({ sessions: { [id]: { ...useChatStore.getState().getSession(id), messages } } })
+    await useChatStore.getState().loadHistory(id)
+    await useChatStore.getState().reloadHistory(id)
+    expect(sessionsApi.getFullHistory).not.toHaveBeenCalled()
+    expect(useChatStore.getState().sessions[id]?.messages).toEqual(messages)
+    expect(useChatStore.getState().sessions[id]?.historyStatus).toBe('ready')
+    unregisterSideChatSession(id)
+  })
+  it('loads side-chat skills without loading durable history and isolates permission acknowledgements', async () => {
+    const id = 'side-skills-test'
+    registerSideChatSession(id, 'main-skills-test')
+    const commands = [{ name: 'fixture-skill', description: 'A skill in this project' }]
+    vi.mocked(sessionsApi.getSlashCommands).mockResolvedValueOnce({ commands })
+    useChatStore.getState().connectToSession(id, { prewarm: false, applyRuntimeSelection: false })
+    await Promise.resolve()
+    expect(sessionsApi.getSlashCommands).toHaveBeenCalledWith(id)
+    expect(sessionsApi.getFullHistory).not.toHaveBeenCalled()
+    expect(useChatStore.getState().sessions[id]?.slashCommands).toEqual(commands)
+    useChatStore.getState().handleServerMessage(id, { type: 'permission_mode_changed', mode: 'plan' })
+    expect(useChatStore.getState().sessions[id]?.permissionMode).toBe('plan')
+    expect(useChatStore.getState().sessions['main-skills-test']).toBeUndefined()
+    useChatStore.getState().disconnectSession(id)
+    unregisterSideChatSession(id)
+  })
   beforeEach(() => {
     providerStoreSnapshot.providers = []
     providerStoreSnapshot.activeId = null
@@ -500,6 +547,7 @@ describe('chatStore history mapping', () => {
     updateTabStatusMock.mockReset()
     updateSessionTitleMock.mockReset()
     updateSessionMessageCountMock.mockReset()
+    updateSessionPermissionModeMock.mockReset()
     connectionStateHandlers.clear()
     vi.mocked(sessionsApi.getFullHistory).mockReset()
     vi.mocked(sessionsApi.getFullHistory).mockResolvedValue({ messages: [] })
@@ -14024,6 +14072,53 @@ describe('chatStore history mapping', () => {
     ])
   })
 
+  it.each([
+    ['Use TypeScript', 'Keep the toolbar compact'],
+    ['Use TypeScript', 'Build the editor'],
+    ['Use TypeScript', 'Use TypeScript'],
+    ['Build the editor', 'Build the editor'],
+  ])('reconciles the delayed initial replay across guides %s / %s without resending', (...guides) => {
+    const initial = 'Build the editor'
+    useChatStore.setState({ sessions: {
+      [TEST_SESSION_ID]: makeSession({ chatState: 'idle' }),
+    } })
+    useChatStore.getState().sendMessage(TEST_SESSION_ID, initial)
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking', text: 'Planning the editor',
+    })
+    for (const content of guides) {
+      const id = useChatStore.getState().queueUserMessage(TEST_SESSION_ID, {
+        content, displayContent: content,
+      })
+      useChatStore.getState().sendQueuedUserMessage(TEST_SESSION_ID, id)
+    }
+    const sentBeforeReplay = sendMock.mock.calls.length
+    for (const content of [initial, ...guides]) {
+      useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+        type: 'user_message_replay', content,
+      })
+      expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+        .filter(message => message.type === 'user_text').map(message => message.content))
+        .toEqual([initial, ...guides])
+    }
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter(message => message.type === 'user_text' && message.optimisticQueued)).toEqual([])
+    expect(sendMock.mock.calls).toHaveLength(sentBeforeReplay)
+    expect(sendMock.mock.calls.filter(([, message]) => message.type === 'user_message')
+      .map(([, message]) => message.content)).toEqual([initial, ...guides])
+  })
+
+  it('does not suppress a new replay just because an older turn has the same text', () => {
+    const messages: UIMessage[] = [
+      { id: 'old', type: 'user_text', content: 'Try again', timestamp: 1 },
+      { id: 'current', type: 'user_text', content: 'Change direction', timestamp: 2 },
+      { id: 'guide', type: 'user_text', content: 'Keep it small', timestamp: 3, optimisticQueued: true },
+    ]
+    expect(appendReplayedUserMessage(messages, 'Try again', 4)
+      .filter(message => message.type === 'user_text').map(message => message.content))
+      .toEqual(['Try again', 'Change direction', 'Keep it small', 'Try again'])
+  })
+
   it('does not duplicate a slash-command prompt when the replay normalizes extra spaces', () => {
     // The composer keeps the raw input (`/ego-browser␣␣https://…` — two spaces
     // after the command name). The CLI preserves them inside <command-args>,
@@ -14385,6 +14480,7 @@ describe('chatStore history mapping', () => {
     expect(useChatStore.getState().sessions['session-a']?.streamingText).toBe('')
     expect(useChatStore.getState().sessions['session-a']?.messages).toMatchObject([
       { type: 'assistant_text', content: 'A-only response' },
+      { type: 'system', content: 'Stopped' },
     ])
     expect(useChatStore.getState().sessions['session-b']?.streamingText).toBe('')
 
@@ -15340,6 +15436,7 @@ describe('chatStore activity state survival across reload paths', () => {
       messages: [
         { id: 'user-disk', type: 'user', content: 'Continue', timestamp: new Date(1).toISOString() },
         { id: 'answer-disk', type: 'assistant', content: 'Stopped answer', timestamp: new Date(2).toISOString() },
+        { id: 'stop-disk', type: 'system', content: { subtype: 'generation_stopped' }, timestamp: new Date(3).toISOString() },
       ],
       page: { nextCursor: null, hasMore: false, historyComplete: false, sourceVersion: 'omitted-earlier-tool', scannedBytes: 10, omittedOversizedEntries: 1 },
     })
@@ -15348,6 +15445,36 @@ describe('chatStore activity state survival across reload paths', () => {
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.messages).toMatchObject([
       { type: 'user_text', content: 'Continue', transcriptMessageId: 'user-disk' },
       { type: 'assistant_text', content: 'Stopped answer', transcriptMessageId: 'answer-disk' },
+      { type: 'system', content: 'Stopped', transcriptMessageId: 'stop-disk' },
+    ])
+  })
+
+  it('restores partial streamed text and the stopped state after reopening the session', async () => {
+    useChatStore.setState({ sessions: { [TEST_SESSION_ID]: makeSession({
+      chatState: 'streaming',
+      streamingText: '0001\n0002\n',
+      messages: [{ id: 'live-user', type: 'user_text', content: 'Count to 1000', timestamp: 1 }],
+    }) } })
+
+    useChatStore.getState().stopGeneration(TEST_SESSION_ID)
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'assistant_text', content: '0001\n0002\n' }),
+      expect.objectContaining({ type: 'system', content: 'Stopped' }),
+    ]))
+
+    vi.mocked(sessionsApi.getFullHistory).mockResolvedValueOnce({ messages: [
+      { id: 'disk-user', type: 'user', content: 'Count to 1000', timestamp: new Date(1).toISOString() },
+      { id: 'disk-partial', type: 'assistant', content: '0001\n0002\n', timestamp: new Date(2).toISOString() },
+      { id: 'disk-stop', type: 'system', content: { subtype: 'generation_stopped' }, timestamp: new Date(3).toISOString() },
+    ] })
+    useChatStore.setState({ sessions: { [TEST_SESSION_ID]: makeSession({ messages: [] }) } })
+
+    await useChatStore.getState().loadHistory(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      { type: 'user_text', content: 'Count to 1000' },
+      { type: 'assistant_text', content: '0001\n0002\n', transcriptMessageId: 'disk-partial' },
+      { type: 'system', content: 'Stopped', transcriptMessageId: 'disk-stop' },
     ])
   })
 

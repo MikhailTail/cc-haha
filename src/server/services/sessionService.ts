@@ -1,5 +1,7 @@
+import { getSideChat, isSideChatId, sideChatSummary } from './sideChatRegistry.js'
 import { splitSessionReferenceContext } from './sessionReferenceContext.js'
 import { parseSessionCollaborationEnvelope } from '../../utils/sessionCollaborationEnvelope.js'
+import { isShutdownTeamPrompt } from '../../utils/swarm/teamShutdownPrompt.js'
 import { readHistoryContexts } from './sessionHistoryContext.js'
 import { recoverBoundedSessionHistory, type SessionHistoryRecovery } from './sessionHistoryRecovery.js'
 /**
@@ -1272,7 +1274,7 @@ export class SessionService {
         customTitle: null as string | null, nonemptyCustomTitle: null as string | null,
         goalTitle: null as string | null, aiTitle: null as string | null, firstUserTitle: null as string | null,
         createdAt: null as string | null, modifiedAt: null as string | null,
-        count: 0, launchCount: 0,
+        count: 0, launchCount: 0, isTeamWorker: false,
       })
       const launch = makeState()
       const summary = makeState()
@@ -1285,6 +1287,7 @@ export class SessionService {
         state.launchCount += this.countTranscriptMessages([entry])
         if (typeof entry.cwd === 'string' && entry.cwd.trim()) state.cwd = normalizeDriveRootPathForPlatform(entry.cwd)
         const record = entry as Record<string, unknown>
+        if (record.entrypoint === 'claude-desktop-team-worker') state.isTeamWorker = true
         if (entry.type === 'session-meta') {
           if (typeof record.workDir === 'string') state.workDir = normalizeDriveRootPathForPlatform(record.workDir)
           state.permissionMode = this.resolvePermissionModeFromEntries([entry]) ?? state.permissionMode
@@ -1324,6 +1327,7 @@ export class SessionService {
           createdAt: summary.createdAt ?? stat.birthtime.toISOString(),
           modifiedAt: summary.modifiedAt ?? stat.mtime.toISOString(),
           messageCount: summary.count,
+          ...(summary.isTeamWorker ? { isTeamWorker: true } : {}),
           workDir: summary.workDir || summary.cwd || this.desanitizePath(projectDir),
           ...shared(summary),
         },
@@ -1818,6 +1822,21 @@ export class SessionService {
     })
   }
 
+  private async fileHasConversationTranscript(filePath: string): Promise<boolean> {
+    let hasTranscript = false
+    const scan = await withHistoryReadBudget(undefined, () => streamBoundedHistory(
+      filePath,
+      entry => {
+        if (!hasTranscript && this.hasConversationTranscript([entry as RawEntry])) hasTranscript = true
+      },
+      undefined,
+      { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES },
+    ), 'metadata')
+    // An oversized record may be the only conversation turn. Prefer that
+    // transcript over a newer metadata-only placeholder until it can be read.
+    return hasTranscript || scan.oversizedRecords > 0
+  }
+
   // --------------------------------------------------------------------------
   // Entry → MessageEntry conversion
   // --------------------------------------------------------------------------
@@ -1828,6 +1847,18 @@ export class SessionService {
   ): MessageEntry | null {
     const msg = entry.message
     if (!msg || !msg.role) return null
+
+    // The CLI records an explicit interrupt as a synthetic user message.
+    // Project it as a status so history retains the stop boundary without
+    // displaying the model-facing sentinel as a user prompt.
+    if (msg.role === 'user' && this.isSyntheticUserInterruption(msg.content)) {
+      return {
+        id: entry.uuid || crypto.randomUUID(),
+        type: 'system',
+        content: { subtype: 'generation_stopped' },
+        timestamp: entry.timestamp || new Date().toISOString(),
+      }
+    }
 
     // Determine our normalized type
     let type: MessageEntry['type']
@@ -2066,8 +2097,8 @@ export class SessionService {
 
     if (role === 'user') {
       return (
+        isShutdownTeamPrompt(content) ||
         shouldHideCommandMetadataContent(content) ||
-        this.isSyntheticUserInterruption(content) ||
         this.isTaskNotificationContent(content)
       )
     }
@@ -2646,11 +2677,10 @@ export class SessionService {
                 sessionId,
                 projectsRoot!,
               )
-              const entries = await this.readJsonlFile(match.filePath)
               hydratedMatches.push({
                 ...match,
                 mtimeMs: stat.mtimeMs,
-                hasTranscript: this.hasConversationTranscript(entries),
+                hasTranscript: await this.fileHasConversationTranscript(match.filePath),
               })
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -2697,12 +2727,11 @@ export class SessionService {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
         const stat = await fs.stat(filePath)
-        const entries = await this.readJsonlFile(filePath)
         matches.push({
           filePath,
           projectDir: dir,
           mtimeMs: stat.mtimeMs,
-          hasTranscript: this.hasConversationTranscript(entries),
+          hasTranscript: await this.fileHasConversationTranscript(filePath),
         })
       } catch {
         continue
@@ -2717,6 +2746,7 @@ export class SessionService {
   async findSessionFile(
     sessionId: string
   ): Promise<{ filePath: string; projectDir: string } | null> {
+    if (isSideChatId(sessionId)) return null
     return (await this.findSessionFiles(sessionId))[0] ?? null
   }
 
@@ -3374,7 +3404,7 @@ export class SessionService {
         try {
           const stat = await fs.stat(file.filePath)
           const summary = await this.getCachedSessionListSummary(file.filePath, file.projectDir, stat, scope)
-          indexedRows.push({ ...summary, id: file.sessionId, projectPath: file.projectDir, transcriptPath: file.filePath })
+          if (!summary.isTeamWorker) indexedRows.push({ ...summary, id: file.sessionId, projectPath: file.projectDir, transcriptPath: file.filePath })
         } catch { /* Ignore unreadable transcripts, like the normal list. */ }
       }
     }
@@ -3754,15 +3784,8 @@ export class SessionService {
     }> = []
     for (const item of filesWithStats) {
       try {
-        summarizedFiles.push({
-          ...item,
-          summary: await this.getCachedSessionListSummary(
-            item.filePath,
-            item.projectDir,
-            item.stat,
-            scope,
-          ),
-        })
+        const summary = await this.getCachedSessionListSummary(item.filePath, item.projectDir, item.stat, scope)
+        if (!summary.isTeamWorker) summarizedFiles.push({ ...item, summary })
       } catch {
         // Skip unreadable files
       }
@@ -3843,6 +3866,10 @@ export class SessionService {
 
   /** Resolve one session's list metadata without materializing its messages. */
   async getSessionSummary(sessionId: string): Promise<SessionListItem | null> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      return side && !side.closed ? sideChatSummary(side) : null
+    }
     this.syncSharedMutationEpoch()
     const scope = this.getConfigDir()
     this.prepareSessionListCaches(scope)
@@ -3924,6 +3951,11 @@ export class SessionService {
    * Read HTTP history and notifications together without merging child payloads.
    */
   async getSessionHistoryRecovery(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<SessionHistoryRecovery> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      if (!side || side.closed) throw ApiError.notFound('Side chat expired')
+      return { sourceVersion: 'ephemeral', status: 'ready', messages: [], taskNotifications: [], tokenUsage: null, omittedRecords: 0 }
+    }
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       const key = this.memorySessionKey(sessionId)
@@ -3990,6 +4022,11 @@ export class SessionService {
     taskNotifications: SessionTaskNotification[]
     page: HistoryPageInfo
   }> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      if (!side || side.closed) throw ApiError.notFound('Side chat expired')
+      return { messages: [], taskNotifications: [], page: { nextCursor: null, hasMore: false, historyComplete: true, sourceVersion: 'ephemeral', scannedBytes: 0, omittedOversizedEntries: 0 } }
+    }
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       const key = this.memorySessionKey(sessionId)
@@ -4058,6 +4095,13 @@ export class SessionService {
     sessionId: string,
     options?: SessionMessagesOptions,
   ): Promise<SessionMessagesWithEvidence> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      if (!side || side.closed) throw ApiError.notFound('Side chat expired')
+      // Temporary history lives in the child process, not in a transcript.
+      // Missing durable evidence must disable rewind rather than report a lost session.
+      return { messages: [], transcriptEvidenceComplete: false }
+    }
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       // Retention-zero sessions intentionally have no transcript. The desktop
@@ -4533,6 +4577,7 @@ export class SessionService {
    * Append an AI-generated title entry to a session's JSONL file.
    */
   async appendAiTitle(sessionId: string, title: string, persist = this.shouldPersistSession()): Promise<void> {
+    if (isSideChatId(sessionId)) return
     if (!persist || !this.shouldPersistSession()) {
       this.rememberPrivateTitle(sessionId, title)
       return
@@ -4550,6 +4595,7 @@ export class SessionService {
   }
 
   async getCustomTitle(sessionId: string): Promise<string | null> {
+    if (isSideChatId(sessionId)) return getSideChat(sessionId)?.launchInfo.customTitle ?? null
     const memory = this.memoryLaunchInfo.get(this.memorySessionKey(sessionId))
     if (memory?.customTitle) return memory.customTitle
     const found = await this.findSessionFile(sessionId)
@@ -4563,6 +4609,7 @@ export class SessionService {
    * First checks for stored session-meta entry, then falls back to desanitizePath.
    */
   async getSessionWorkDir(sessionId: string): Promise<string | null> {
+    if (isSideChatId(sessionId)) return getSideChat(sessionId)?.launchInfo.workDir ?? null
     const memory = this.memoryLaunchInfo.get(this.memorySessionKey(sessionId))
     if (memory) return memory.workDir
     const found = await this.findSessionFile(sessionId)
@@ -4590,6 +4637,10 @@ export class SessionService {
    * Placeholder desktop-created sessions have zero transcript messages.
    */
   async getSessionLaunchInfo(sessionId: string): Promise<SessionLaunchInfo | null> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      return side && !side.closed ? { ...side.launchInfo } : null
+    }
     const memory = this.memoryLaunchInfo.get(this.memorySessionKey(sessionId))
     const found = await this.findSessionFile(sessionId)
     if (!found) return memory ? { ...memory, transcriptMessageCount: 0 } : null
@@ -4613,6 +4664,7 @@ export class SessionService {
     preservedPermissionMode?: string,
     preservedCustomTitle?: string | null,
   ): Promise<void> {
+    if (isSideChatId(sessionId)) throw ApiError.conflict('Open a new side chat to clear temporary history')
     const persist = this.shouldPersistSession()
     const nextEpoch = (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) + 1
     this.taskNotificationMutationEpochs.set(sessionId, nextEpoch)
@@ -4757,6 +4809,11 @@ export class SessionService {
       effortLevel?: string
     }
   ): Promise<void> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      if (side && !side.closed) Object.assign(side.launchInfo, metadata)
+      return
+    }
     const persist = this.shouldPersistSession()
     const storedInfo = await this.getSessionLaunchInfo(sessionId)
     if (storedInfo) this.knownSessionKeys.add(this.memorySessionKey(sessionId))
@@ -5003,6 +5060,11 @@ export class SessionService {
     sessionId: string,
     options: { bounded?: boolean } = {},
   ): Promise<FileHistorySnapshot[]> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      if (!side || side.closed) throw ApiError.notFound('Side chat expired')
+      return []
+    }
     const found = await this.findSessionFile(sessionId)
     if (!found) {
       throw ApiError.notFound(`Session not found: ${sessionId}`)

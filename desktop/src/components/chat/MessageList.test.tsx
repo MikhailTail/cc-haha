@@ -1,3 +1,4 @@
+import { openSideChat } from '@/lib/workspace/openSideChat'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import {
@@ -41,6 +42,8 @@ import type { MessageEntry } from '../../types/session'
 import type { PerSessionState } from '../../stores/chatStore'
 import { FindInPageModal } from '../search/FindInPageModal'
 import { getConversationFindController } from '../search/conversationFindBridge'
+
+vi.mock('@/lib/workspace/openSideChat', () => ({ openSideChat: vi.fn(async () => 'tab-side') }))
 
 const ACTIVE_TAB = 'active-tab'
 
@@ -3643,6 +3646,21 @@ describe('MessageList nested tool calls', () => {
     expect(document.activeElement).not.toBe(copyButton)
   })
 
+  it('opens a side chat with a selected quote without adding it to the main composer', async () => {
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [{
+      id: 'assistant-side', type: 'assistant_text', content: 'Explain this isolated selection.', timestamp: 1,
+    }] }) } })
+    render(<MessageList />)
+    await selectMessageText(screen.getByText('Explain this isolated selection.'), 'isolated selection')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask in side chat' }))
+    expect(openSideChat).toHaveBeenCalledWith(ACTIVE_TAB, { reference: {
+      kind: 'chat-selection', path: 'chat://assistant/assistant-side', name: 'Assistant message',
+      quote: 'isolated selection', sourceRole: 'assistant', messageId: 'assistant-side',
+    } })
+    expect(useWorkspaceChatContextStore.getState().referencesBySession[ACTIVE_TAB] ?? []).toEqual([])
+    expect(window.getSelection()?.toString()).toBe('')
+  })
+
   it('adds selected user message text to the composer context', async () => {
     useChatStore.setState({
       sessions: {
@@ -3663,8 +3681,8 @@ describe('MessageList nested tool calls', () => {
     await selectMessageText(userText, 'workspace selection behavior')
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect(floatingAddButton.style.left).toBe('141px')
-    expect(floatingAddButton.style.top).toBe('26px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('40px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('26px')
 
     fireEvent.click(floatingAddButton)
 
@@ -3849,8 +3867,8 @@ describe('MessageList nested tool calls', () => {
     })
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect(floatingAddButton.style.left).toBe('290px')
-    expect(floatingAddButton.style.top).toBe('12px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('290px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('12px')
   })
 
   it('adds multi-line assistant reply selections across markdown blocks to the composer context', async () => {
@@ -3886,8 +3904,8 @@ describe('MessageList nested tool calls', () => {
     )
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect(floatingAddButton.style.left).toBe('530px')
-    expect(floatingAddButton.style.top).toBe('129px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('530px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('129px')
 
     fireEvent.click(floatingAddButton)
 
@@ -6323,6 +6341,26 @@ describe('MessageList nested tool calls', () => {
   })
 
   it('preserves the expanded change card through virtual unmount and returns to its file opener', async () => {
+    const frames = new Map<number, FrameRequestCallback>()
+    let nextFrameId = 0
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      const id = ++nextFrameId
+      frames.set(id, callback)
+      return id
+    }))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn((id: number) => frames.delete(id)))
+    const advanceFrame = async (time: number) => {
+      const scheduled = [...frames.keys()]
+      await act(async () => {
+        for (const id of scheduled) {
+          const callback = frames.get(id)
+          frames.delete(id)
+          callback?.(time)
+        }
+        await Promise.resolve()
+      })
+    }
+
     vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValue({ checkpoints: [{
       target: { targetUserMessageId: 'user-virtual-file', userMessageIndex: 0, userMessageCount: 221 },
       code: { available: true, filesChanged: ['src/virtual.ts'], insertions: 1, deletions: 0 },
@@ -6344,7 +6382,7 @@ describe('MessageList nested tool calls', () => {
     const scrollArea = container.querySelector<HTMLElement>('.chat-scroll-area')!
     Object.defineProperty(scrollArea, 'clientHeight', { configurable: true, value: 500 })
     Object.defineProperty(scrollArea, 'scrollHeight', { configurable: true, value: 222 * 112 })
-    await waitForProgrammaticScrollReset()
+    await advanceFrame(0)
     scrollArea.scrollTop = 0
     fireEvent.scroll(scrollArea)
     fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }))
@@ -6353,15 +6391,19 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin)
       .toEqual({ sourceTurnKey: 'assistant-virtual-file', sourceElementId: opener.id }))
 
-    await waitForProgrammaticScrollReset()
+    await advanceFrame(16)
     scrollArea.scrollTop = 222 * 112 - 500
     fireEvent.scroll(scrollArea)
     await waitFor(() => expect(container.querySelector('[data-chat-render-item-key="assistant-virtual-file"]')).toBeNull())
     act(() => useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden'))
 
-    const remountedOpener = await screen.findByRole('button', { name: 'Open src/virtual.ts in workspace' })
+    // The first frame remounts the virtual row; the next frame restores focus.
+    // Flush React between frames instead of racing real rAF against role queries.
+    await advanceFrame(32)
+    const remountedOpener = screen.getByRole('button', { name: 'Open src/virtual.ts in workspace' })
     expect(remountedOpener).not.toBe(opener)
-    await waitFor(() => expect(document.activeElement).toBe(remountedOpener))
+    await advanceFrame(48)
+    expect(document.activeElement).toBe(remountedOpener)
     expect(screen.getByRole('button', { name: 'Hide changed files' }).getAttribute('aria-expanded')).toBe('true')
     expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
   })
@@ -7098,6 +7140,9 @@ describe('MessageList nested tool calls', () => {
       })
     const reloadHistory = vi.fn().mockResolvedValue(undefined)
     const queueComposerPrefill = vi.fn()
+    const reviewTabId = useWorkspaceStore.getState().openTarget(ACTIVE_TAB, {
+      kind: 'review', source: { kind: 'turn', turnKey: 'user-1', userMessageIndex: 0 },
+    })!
 
     useChatStore.setState({
       reloadHistory,
@@ -7162,6 +7207,7 @@ describe('MessageList nested tool calls', () => {
       })
     })
     expect(reloadHistory).toHaveBeenCalledWith(ACTIVE_TAB)
+    expect(useWorkspaceStore.getState().getTab(ACTIVE_TAB, reviewTabId)).toBeNull()
     expect(queueComposerPrefill).toHaveBeenCalledWith(ACTIVE_TAB, {
       text: prompt,
       attachments: undefined,
