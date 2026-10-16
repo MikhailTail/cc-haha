@@ -42,4 +42,14 @@ describe('telemetry resource detection', () => {
 
     expect(detectCalls).toBe(0)
   })
+
+  test('normalizeHostArch maps every Node arch value like the detector does', async () => {
+    const { normalizeHostArch } = await import('./instrumentation.js')
+
+    expect(normalizeHostArch('arm')).toBe('arm32')
+    expect(normalizeHostArch('ppc')).toBe('ppc32')
+    expect(normalizeHostArch('x64')).toBe('amd64')
+    expect(normalizeHostArch('arm64')).toBe('arm64')
+    expect(normalizeHostArch('ia32')).toBe('ia32')
+  })
 })

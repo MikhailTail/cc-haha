@@ -424,8 +424,9 @@ async function initializeBetaTracing(
  * Mirrors normalizeArch from @opentelemetry/resources
  * (detectors/platform/node/utils), which is not part of that package's public
  * API. Kept in sync with it so host.arch keeps reporting the same value.
+ * Exported so the mapping can be tested for every Node arch value.
  */
-function normalizeHostArch(nodeArch: string): string {
+export function normalizeHostArch(nodeArch: string): string {
   switch (nodeArch) {
     case 'arm':
       return 'arm32'
