@@ -5,7 +5,6 @@ import { logs } from '@opentelemetry/api-logs'
 // signal, but static imports would load all 6 (~1.2MB) on every startup.
 import {
   envDetector,
-  hostDetector,
   osDetector,
   resourceFromAttributes,
 } from '@opentelemetry/resources'
@@ -30,6 +29,7 @@ import {
   SEMRESATTRS_HOST_ARCH,
 } from '@opentelemetry/semantic-conventions'
 import { HttpsProxyAgent } from 'https-proxy-agent'
+import { arch } from 'node:os'
 import {
   getLoggerProvider,
   getMeterProvider,
@@ -418,6 +418,26 @@ async function initializeBetaTracing(
   })
 }
 
+/**
+ * Map Node's os.arch() values onto the host.arch semantic convention values.
+ *
+ * Mirrors normalizeArch from @opentelemetry/resources
+ * (detectors/platform/node/utils), which is not part of that package's public
+ * API. Kept in sync with it so host.arch keeps reporting the same value.
+ */
+function normalizeHostArch(nodeArch: string): string {
+  switch (nodeArch) {
+    case 'arm':
+      return 'arm32'
+    case 'ppc':
+      return 'ppc32'
+    case 'x64':
+      return 'amd64'
+    default:
+      return nodeArch
+  }
+}
+
 export async function initializeTelemetry() {
   profileCheckpoint('telemetry_init_start')
   bootstrapTelemetry()
@@ -490,14 +510,15 @@ export async function initializeTelemetry() {
     osDetector.detect().attributes || {},
   )
 
-  // Extract only host.arch from hostDetector
-  const hostDetected = hostDetector.detect()
-  const hostArchAttributes = hostDetected.attributes?.[SEMRESATTRS_HOST_ARCH]
-    ? {
-        [SEMRESATTRS_HOST_ARCH]: hostDetected.attributes[SEMRESATTRS_HOST_ARCH],
-      }
-    : {}
-  const hostArchResource = resourceFromAttributes(hostArchAttributes)
+  // Read host.arch directly rather than through hostDetector. That detector's
+  // detect() also calls getMachineId(), which shells out to
+  // `REG.exe QUERY ...\Cryptography /v MachineGuid` via child_process.exec with
+  // no windowsHide. The desktop CLI runs without a console (sidecar and CLI
+  // child are both spawned hidden), so Windows allocates a visible console
+  // window for it on every session start. Only host.arch was kept here anyway.
+  const hostArchResource = resourceFromAttributes({
+    [SEMRESATTRS_HOST_ARCH]: normalizeHostArch(arch()),
+  })
 
   const envResource = resourceFromAttributes(
     envDetector.detect().attributes || {},
